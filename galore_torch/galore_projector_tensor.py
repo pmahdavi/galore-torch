@@ -14,15 +14,18 @@ class GaLoreProjectorTensor:
         verbose (bool, optional): Whether to print verbose output. Defaults to False.
         update_proj_gap (int, optional): The number of iterations between updating the orthogonal matrix. Defaults to 200.
         scale (float, optional): The scaling factor for the projected gradients. Defaults to 1.0.
+        proj_type (str, optional): The projection type (not used for tensor projector). Defaults to "std".
     """
 
-    def __init__(self, rank, verbose=False, update_proj_gap=200, scale=1.0):
+    def __init__(self, rank, verbose=False, update_proj_gap=200, scale=1.0, proj_type="std"):
+        # proj_type is not used but added for compatibility with GaLoreProjector
         self.rank = rank
         self.verbose = verbose
         self.update_proj_gap = update_proj_gap
         self.scale = scale
         self.ortho_matrix = None
         self.transformed_low_rank = None
+        self.orig_shape = None
         
     def project(self, full_rank_grad, iter):
         """
@@ -53,10 +56,10 @@ class GaLoreProjectorTensor:
         full_rank_grad = self.inverse_transform(self.ortho_matrix, self.transformed_low_rank)     
         return full_rank_grad * self.scale
         
-    # svd decomposition
+    # tensor decomposition
     def get_orthogonal_matrix(self, weights, rank_all):
         """
-        Computes the orthogonal matrix using SVD decomposition.
+        Computes the orthogonal matrix using tensor decomposition.
 
         Args:
             weights (torch.Tensor): The weights to decompose.
@@ -70,8 +73,44 @@ class GaLoreProjectorTensor:
             matrix = module_params.data.float()
         else:
             matrix = module_params.data
-        tucker_tensor = tucker(matrix, rank=rank_all)
-        return tucker_tensor
+            
+        # Store original shape for later reshaping
+        self.orig_shape = matrix.shape
+            
+        # For tensor decomposition, we need to specify rank as a list with one value per dimension
+        # Convert integer rank to a list of ranks for each dimension
+        if isinstance(rank_all, int):
+            rank_list = [rank_all] * matrix.ndim
+        else:
+            rank_list = rank_all
+            
+        try:
+            # Use the proper rank format for tensor decomposition
+            tucker_tensor = tucker(matrix, rank=rank_list)
+            return tucker_tensor
+        except Exception as e:
+            # Fallback to simpler approach if tensor decomposition fails
+            print(f"Warning: Tucker decomposition failed: {e}")
+            print(f"Using simpler approach for tensor with shape {matrix.shape}")
+            
+            # Reshape tensor to 2D for standard decomposition
+            orig_shape = matrix.shape
+            matrix_2d = matrix.reshape(orig_shape[0], -1)
+            
+            # Use SVD for 2D decomposition
+            U, S, Vh = torch.linalg.svd(matrix_2d, full_matrices=False)
+            
+            # Truncate to rank
+            U = U[:, :rank_all]
+            S = S[:rank_all]
+            Vh = Vh[:rank_all, :]
+            
+            # Return in a format compatible with multi_mode_dot
+            factors = [U]
+            core = torch.diag(S).mm(Vh)
+            
+            # Return a tuple similar to tucker decomposition
+            return (core, factors)
 
     def transform(self, tensor, x):
         """
@@ -84,8 +123,21 @@ class GaLoreProjectorTensor:
         Returns:
             torch.Tensor: The transformed tensor.
         """
-        _, factors = tensor
-        return tenalg.multi_mode_dot(x, factors, transpose=True)
+        core, factors = tensor
+        
+        # Check if we're using the fallback approach (just one factor)
+        if len(factors) == 1:
+            # Handle the fallback SVD approach
+            # Reshape input tensor to 2D
+            orig_shape = x.shape
+            x_2d = x.reshape(orig_shape[0], -1)
+            
+            # Project using the single factor
+            result = torch.matmul(factors[0].t(), x_2d)
+            return result
+        else:
+            # Regular Tucker decomposition approach
+            return tenalg.multi_mode_dot(x, factors, transpose=True)
 
     def inverse_transform(self, tensor, x):
         """
@@ -98,5 +150,23 @@ class GaLoreProjectorTensor:
         Returns:
             torch.Tensor: The inverse transformed tensor.
         """
-        _, factors = tensor
-        return tenalg.multi_mode_dot(x, factors)
+        core, factors = tensor
+        
+        # Check if we're using the fallback approach (just one factor)
+        if len(factors) == 1:
+            # Handle the fallback SVD approach
+            result = torch.matmul(factors[0], x)
+            
+            # Reshape back to original tensor shape
+            # We need to infer the original shape from the factor dimensions
+            factor_shape = factors[0].shape
+            if hasattr(self, 'orig_shape') and self.orig_shape is not None:
+                result = result.reshape(self.orig_shape)
+            else:
+                # Try to infer a reasonable shape if original shape not stored
+                result = result.reshape(factor_shape[0], -1)
+                
+            return result
+        else:
+            # Regular Tucker decomposition approach
+            return tenalg.multi_mode_dot(x, factors)

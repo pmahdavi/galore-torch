@@ -33,6 +33,8 @@ class AdamW(Optimizer):
             Whether or not to correct bias in Adam (for instance, in Bert TF repository they use `False`).
         no_deprecation_warning (`bool`, *optional*, defaults to `False`):
             A flag used to disable the deprecation warning (set to `True` to disable the warning).
+        fused (`bool`, *optional*, defaults to `False`):
+            Whether to use fused-backward mode that hooks into gradient accumulation.
     """
 
     def __init__(
@@ -44,6 +46,7 @@ class AdamW(Optimizer):
         weight_decay: float = 0.0,
         correct_bias: bool = True,
         no_deprecation_warning: bool = False,
+        fused: bool = False,
     ):
         if not no_deprecation_warning:
             warnings.warn(
@@ -61,8 +64,29 @@ class AdamW(Optimizer):
             raise ValueError(f"Invalid beta parameter: {betas[1]} - should be in [0.0, 1.0)")
         if not 0.0 <= eps:
             raise ValueError(f"Invalid epsilon value: {eps} - should be >= 0.0")
-        defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay, "correct_bias": correct_bias}
+        defaults = {
+            "lr": lr, 
+            "betas": betas, 
+            "eps": eps, 
+            "weight_decay": weight_decay, 
+            "correct_bias": correct_bias,
+            "fused": fused,      # NEW: opt-in fused-backward
+        }
         super().__init__(params, defaults)
+        
+        # Create param-to-group mapping for hooks
+        self._param_to_group = {}
+        for group in self.param_groups:
+            for p in group["params"]:
+                self._param_to_group[id(p)] = group
+        
+        # register fused-backward hooks if requested
+        for group in self.param_groups:
+            if group.get("fused", False):
+                for p in group["params"]:
+                    p.register_post_accumulate_grad_hook(
+                        self._fused_accumulate_grad_hook
+                    )
 
     @torch.no_grad()
     def step(self, closure: Callable = None):
@@ -72,6 +96,10 @@ class AdamW(Optimizer):
         Arguments:
             closure (`Callable`, *optional*): A closure that reevaluates the model and returns the loss.
         """
+        # fused feature: delegate to fused-update if enabled
+        if any(group.get("fused", False) for group in self.param_groups):
+            return self._apply_fused_update()
+
         loss = None
         if closure is not None:
             loss = closure()
@@ -146,3 +174,94 @@ class AdamW(Optimizer):
                     p.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
 
         return loss
+
+    def _fused_accumulate_grad_hook(self, param: torch.Tensor):
+        """
+        Called per-parameter per-backward:
+        - Project/update GaLore moment buffers
+        - Clear raw grad to free memory
+        """
+        state = self.state[param]
+        
+        # Get parameter group using stored mapping
+        group = self._param_to_group[id(param)]
+        
+        # Set default dim if not present
+        if 'dim' not in group:
+            group['dim'] = 2
+            
+        # lazy init projector
+        if "rank" in group and "projector" not in state:
+            ctor = (GaLoreProjector if group["dim"] <= 2 else GaLoreProjectorTensor)
+            state["projector"] = ctor(
+                group["rank"],
+                update_proj_gap=group["update_proj_gap"],
+                scale=group["scale"],
+                proj_type=group["proj_type"],
+            )
+            
+        grad = param.grad
+        # apply projection if needed
+        if "rank" in group:
+            grad = state["projector"].project(grad, state.get("step", 0))
+            
+        # init moment buffers
+        if "exp_avg" not in state:
+            state["exp_avg"]    = torch.zeros_like(grad)
+            state["exp_avg_sq"] = torch.zeros_like(grad)
+            
+        beta1, beta2 = group["betas"]
+        # update moments
+        state["exp_avg"].mul_(beta1).add_(grad, alpha=(1 - beta1))
+        state["exp_avg_sq"].mul_(beta2).addcmul_(grad, grad, value=(1 - beta2))
+        
+        # clear raw grad
+        param.grad = None
+
+    def _apply_fused_update(self):
+        """
+        Called on .step() when fused=True:
+        - Performs bias-correct, back-project, weight add, weight-decay
+        """
+        for group in self.param_groups:
+            if not group.get("fused", False):
+                continue
+                
+            lr, eps, wd = (group[k] for k in ("lr","eps","weight_decay"))
+            correct = group["correct_bias"]
+            beta1, beta2 = group["betas"]
+            
+            for param in group["params"]:
+                state = self.state[param]
+                
+                # Skip parameters that didn't receive gradients (e.g., if they were
+                # in a different branch that wasn't executed)
+                if "exp_avg" not in state:
+                    continue
+                    
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                
+                # increment step count
+                step = state.get("step", 0) + 1
+                state["step"] = step
+                
+                # bias correction
+                if correct:
+                    bias1 = 1 - beta1 ** step
+                    bias2 = 1 - beta2 ** step
+                    step_size = lr * (math.sqrt(bias2) / bias1)
+                else:
+                    step_size = lr
+                    
+                denom = exp_avg_sq.sqrt().add_(eps)
+                norm_grad = exp_avg.div(denom)
+                
+                if "rank" in group:
+                    norm_grad = state["projector"].project_back(norm_grad)
+                    
+                param.add_(norm_grad, alpha=-step_size)
+                
+                if wd > 0:
+                    param.add_(param, alpha=-lr * wd)
+                    
+        return None

@@ -33,8 +33,6 @@ class AdamW(Optimizer):
             Whether or not to correct bias in Adam (for instance, in Bert TF repository they use `False`).
         no_deprecation_warning (`bool`, *optional*, defaults to `False`):
             A flag used to disable the deprecation warning (set to `True` to disable the warning).
-        fused (`bool`, *optional*, defaults to `False`):
-            Whether to use fused-backward mode that hooks into gradient accumulation.
     """
 
     def __init__(
@@ -46,7 +44,6 @@ class AdamW(Optimizer):
         weight_decay: float = 0.0,
         correct_bias: bool = True,
         no_deprecation_warning: bool = False,
-        fused: bool = False,
     ):
         if not no_deprecation_warning:
             warnings.warn(
@@ -65,12 +62,11 @@ class AdamW(Optimizer):
         if not 0.0 <= eps:
             raise ValueError(f"Invalid epsilon value: {eps} - should be >= 0.0")
         defaults = {
-            "lr": lr, 
-            "betas": betas, 
-            "eps": eps, 
-            "weight_decay": weight_decay, 
+            "lr": lr,
+            "betas": betas,
+            "eps": eps,
+            "weight_decay": weight_decay,
             "correct_bias": correct_bias,
-            "fused": fused,      # NEW: opt-in fused-backward
         }
         super().__init__(params, defaults)
         
@@ -80,7 +76,7 @@ class AdamW(Optimizer):
             for p in group["params"]:
                 self._param_to_group[id(p)] = group
         
-        # register fused-backward hooks if requested
+        # register fused-backward hooks if requested *within the group*
         for group in self.param_groups:
             if group.get("fused", False):
                 for p in group["params"]:

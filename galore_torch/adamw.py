@@ -207,9 +207,25 @@ class AdamW(Optimizer):
             state["exp_avg_sq"] = torch.zeros_like(grad)
             
         beta1, beta2 = group["betas"]
-        # update moments
-        state["exp_avg"].mul_(beta1).add_(grad, alpha=(1 - beta1))
-        state["exp_avg_sq"].mul_(beta2).addcmul_(grad, grad, value=(1 - beta2))
+        
+        # check "last_iter" in state, and if does not exist set it to -1
+        if "last_iter" not in state:
+            state["last_iter"] = -1
+
+        # Initialize step if it doesn't exist
+        if "step" not in state:
+             state["step"] = 0
+
+        # update moments conditional on being in first iteration of gradient accumulation.
+        # we check that by comparing "step" key in state to last_iter
+        if state["step"] != state["last_iter"]:
+            state["exp_avg"].mul_(beta1).add_(grad, alpha=(1 - beta1))
+            state["exp_avg_sq"].mul_(beta2).addcmul_(grad, grad, value=(1 - beta2))
+            state["last_iter"] = state["step"]
+        else:
+            # if not in first iteration, just update moments
+            state["exp_avg"].add_(grad, alpha=(1 - beta1))
+            state["exp_avg_sq"].addcmul_(grad, grad, value=(1 - beta2))
         
         # clear raw grad
         param.grad = None

@@ -92,81 +92,104 @@ class AdamW(Optimizer):
         Arguments:
             closure (`Callable`, *optional*): A closure that reevaluates the model and returns the loss.
         """
-        # fused feature: delegate to fused-update if enabled
-        if any(group.get("fused", False) for group in self.param_groups):
-            return self._apply_fused_update()
-
         loss = None
         if closure is not None:
-            loss = closure()
+            with torch.enable_grad(): # Ensure grads are enabled for closure
+                loss = closure()
 
+        # Handle fused groups first
+        # _apply_fused_update will iterate through self.param_groups and
+        # only process groups that have group.get("fused", False) == True.
+        # For these groups, p.grad is cleared by the hook _fused_accumulate_grad_hook
+        # and the update uses state["projected_grad_accum"].
+        any_fused_groups = any(group.get("fused", False) for group in self.param_groups)
+        if any_fused_groups:
+            self._apply_fused_update()
+
+        # Now, handle non-fused groups, or all groups if no group was fused.
+        # This logic relies on p.grad being available.
+        # If any_fused_groups is true, this loop will skip the already processed fused groups.
         for group in self.param_groups:
+            if group.get("fused", False): # If fused, it was handled by _apply_fused_update
+                continue
+
+            # Standard non-fused update logic for this non-fused group (or any group if no fusion at all)
             for p in group["params"]:
                 if p.grad is None:
+                    # For non-fused parameters, grad should exist if computed.
+                    # If it's None, it means no gradient for this param in this step.
                     continue
-                grad = p.grad
+
+                grad = p.grad # Original gradient
                 if grad.is_sparse:
-                    raise RuntimeError("Adam does not support sparse gradients, please consider SparseAdam instead")
+                    raise RuntimeError("AdamW does not support sparse gradients, please consider SparseAdam instead")
 
                 state = self.state[p]
                 
+                # Initialize step for this parameter if it's the first time
                 if "step" not in state:
                     state["step"] = 0
                 
-                if 'dim' not in group:
-                    group['dim'] = 2
-                    
-                # GaLore Projection
+                # GaLore Projection: Apply if "rank" is in group.
+                # This handles cases where GaLore is used for a group but not in fused mode.
+                # For truly non-GaLore groups (like embeddings, lm_head from llamafactory),
+                # "rank" won't be present, so this block is skipped.
                 if "rank" in group:
                     if "projector" not in state:
-                        if group['dim'] <=2:
-                            state["projector"] = GaLoreProjector(group["rank"], update_proj_gap=group["update_proj_gap"], scale=group["scale"], proj_type=group["proj_type"])
-                        else:
-                            state["projector"] = GaLoreProjectorTensor(group["rank"], update_proj_gap=group["update_proj_gap"], scale=group["scale"], proj_type=group["proj_type"])
-                    grad = state["projector"].project(grad, state["step"])
+                        # Default dim for projector if not specified in group
+                        if 'dim' not in group:
+                            group['dim'] = 2 
 
-                # State initialization
+                        if group['dim'] <= 2:
+                            state["projector"] = GaLoreProjector(
+                                group["rank"], 
+                                update_proj_gap=group["update_proj_gap"], 
+                                scale=group["scale"], 
+                                proj_type=group["proj_type"]
+                            )
+                        else:
+                            state["projector"] = GaLoreProjectorTensor(
+                                group["rank"], 
+                                update_proj_gap=group["update_proj_gap"], 
+                                scale=group["scale"], 
+                                proj_type=group["proj_type"]
+                            )
+                    # grad variable is updated to the projected gradient
+                    grad = state["projector"].project(grad, state["step"]) 
+
+                # Adam State initialization (using potentially projected grad for shapes)
                 if "exp_avg" not in state:
-                    # Exponential moving average of gradient values
                     state["exp_avg"] = torch.zeros_like(grad)
-                    # Exponential moving average of squared gradient values
                     state["exp_avg_sq"] = torch.zeros_like(grad)
 
                 exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
                 beta1, beta2 = group["betas"]
 
-                state["step"] += 1
+                state["step"] += 1 # Increment step count for this parameter
 
-                # Decay the first and second moment running average coefficient
-                # In-place operations to update the averages at the same time
+                # AdamW update computation
                 exp_avg.mul_(beta1).add_(grad, alpha=(1.0 - beta1))
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
                 denom = exp_avg_sq.sqrt().add_(group["eps"])
 
                 step_size = group["lr"]
-                if group["correct_bias"]:  # No bias correction for Bert
+                if group["correct_bias"]:
                     bias_correction1 = 1.0 - beta1 ** state["step"]
                     bias_correction2 = 1.0 - beta2 ** state["step"]
                     step_size = step_size * math.sqrt(bias_correction2) / bias_correction1
 
-                # compute norm gradient
-                norm_grad = exp_avg / denom
+                norm_grad = exp_avg / denom # This is the normalized gradient update
                 
-                # GaLore Projection Back
+                # GaLore Projection Back: Apply if "rank" is in group (matching the projection step)
                 if "rank" in group:
                     norm_grad = state["projector"].project_back(norm_grad)
                 
+                # Apply parameter update
                 p.add_(norm_grad, alpha=-step_size)
 
-                # Just adding the square of the weights to the loss function is *not*
-                # the correct way of using L2 regularization/weight decay with Adam,
-                # since that will interact with the m and v parameters in strange ways.
-                #
-                # Instead we want to decay the weights in a manner that doesn't interact
-                # with the m/v parameters. This is equivalent to adding the square
-                # of the weights to the loss with plain (non-momentum) SGD.
-                # Add weight decay at the end (fixed version)
+                # Weight decay application
                 if group["weight_decay"] > 0.0:
+                    # AdamW's decoupled weight decay
                     p.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
 
         return loss
@@ -174,7 +197,8 @@ class AdamW(Optimizer):
     def _fused_accumulate_grad_hook(self, param: torch.Tensor):
         """
         Called per-parameter per-backward:
-        - Project/update GaLore moment buffers
+        - Project gradient
+        - Accumulate projected gradient
         - Clear raw grad to free memory
         """
         state = self.state[param]
@@ -196,36 +220,35 @@ class AdamW(Optimizer):
                 proj_type=group["proj_type"],
             )
             
-        grad = param.grad
-        # apply projection if needed
-        if "rank" in group:
-            grad = state["projector"].project(grad, state.get("step", 0))
-            
-        # init moment buffers
-        if "exp_avg" not in state:
-            state["exp_avg"]    = torch.zeros_like(grad)
-            state["exp_avg_sq"] = torch.zeros_like(grad)
-            
-        beta1, beta2 = group["betas"]
+        if param.grad is None: # Should not happen if hook is called, but good practice
+            return
+
+        raw_grad = param.grad
         
-        # check "last_iter" in state, and if does not exist set it to -1
-        if "last_iter" not in state:
-            state["last_iter"] = -1
+        # Apply projection if needed
+        if "rank" in group:
+            projected_grad = state["projector"].project(raw_grad, state.get("step", 0))
+        else: # Should not happen for fused GaLore, but as a fallback
+            projected_grad = raw_grad.clone() 
+            
+        # Accumulate projected gradient
+        # state["step"] is the current completed optimizer step count.
+        # The hook is called for micro-batches of the *next* optimizer step.
+        # We use "optimizer_step_for_accumulation" to track which optimizer step these grads belong to.
+        
+        current_optimizer_step_count = state.get("step", 0)
 
-        # Initialize step if it doesn't exist
-        if "step" not in state:
-             state["step"] = 0
-
-        # update moments conditional on being in first iteration of gradient accumulation.
-        # we check that by comparing "step" key in state to last_iter
-        if state["step"] != state["last_iter"]:
-            state["exp_avg"].mul_(beta1).add_(grad, alpha=(1 - beta1))
-            state["exp_avg_sq"].mul_(beta2).addcmul_(grad, grad, value=(1 - beta2))
-            state["last_iter"] = state["step"]
+        if state.get("optimizer_step_for_accumulation", -1) != current_optimizer_step_count:
+            # This is the first micro-batch for the upcoming optimizer step (current_optimizer_step_count + 1)
+            # Or, the optimizer step has advanced, so we reset accumulation.
+            state["projected_grad_accum"] = projected_grad.clone()
+            state["optimizer_step_for_accumulation"] = current_optimizer_step_count
         else:
-            # if not in first iteration, just update moments
-            state["exp_avg"].add_(grad, alpha=(1 - beta1))
-            state["exp_avg_sq"].addcmul_(grad, grad, value=(1 - beta2))
+            # Subsequent micro-batch for the same upcoming optimizer step
+            if "projected_grad_accum" in state:
+                state["projected_grad_accum"].add_(projected_grad)
+            else: # Should have been initialized in the if block
+                state["projected_grad_accum"] = projected_grad.clone()
         
         # clear raw grad
         param.grad = None
@@ -233,6 +256,7 @@ class AdamW(Optimizer):
     def _apply_fused_update(self):
         """
         Called on .step() when fused=True:
+        - Uses accumulated projected gradient to update moments.
         - Performs bias-correct, back-project, weight add, weight-decay
         """
         for group in self.param_groups:
@@ -246,17 +270,61 @@ class AdamW(Optimizer):
             for param in group["params"]:
                 state = self.state[param]
                 
-                # Skip parameters that didn't receive gradients (e.g., if they were
-                # in a different branch that wasn't executed)
-                if "exp_avg" not in state:
+                # Retrieve accumulated projected gradient
+                accumulated_projected_grad = state.pop("projected_grad_accum", None)
+
+                # If no accumulated grad (e.g. param not part of GaLore group with "rank", or no grads received)
+                # and no existing moments, skip. If moments exist, it implies it was updated in a previous step,
+                # and this step it received no grad. Adam updates will handle this (moments decay).
+                if accumulated_projected_grad is None and "exp_avg" not in state :
                     continue
-                    
-                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
-                
-                # increment step count
+
+                # increment step count first, as it's used for bias correction
+                # and projector's internal step tracking if it relies on optimizer step
                 step = state.get("step", 0) + 1
                 state["step"] = step
                 
+                # Initialize moment buffers if they don't exist
+                # This handles the case where a parameter might not have received a gradient
+                # in the very first step but does now, or if using accumulated_projected_grad
+                # for the first time.
+                if "exp_avg" not in state:
+                    # If accumulated_projected_grad is None here, but moments need init,
+                    # it implies an issue or a parameter that was expected to have grads but didn't.
+                    # For safety, initialize with zeros of param shape if grad is missing.
+                    # However, GaLore params should always have "rank" and thus projector.
+                    # The grad for init should ideally be from accumulated_projected_grad.
+                    if accumulated_projected_grad is not None:
+                        state["exp_avg"]    = torch.zeros_like(accumulated_projected_grad)
+                        state["exp_avg_sq"] = torch.zeros_like(accumulated_projected_grad)
+                    elif "rank" in group: # GaLore parameter that got no grad, init with zeros based on param shape
+                        # This case is tricky. If projector needs a specific shape for its grads,
+                        # this might be problematic. Assuming projector outputs gradients of same shape as param for now.
+                        # This usually means param.shape if projection is done and then undone, or projected shape.
+                        # Since moments are on projected grads, this needs careful thought.
+                        # The projector.project gives the shape. Let's assume it's param.shape for Adam moments.
+                        # This part of logic matches original code: moments are like the grad.
+                        # If accumulated_projected_grad is None, but it's a GaLore param,
+                        # it means it got no grad through all accumulation steps.
+                        # So, its contribution to moments is zero.
+                        state["exp_avg"]    = torch.zeros_like(param.data) # Defaulting to param.data shape
+                        state["exp_avg_sq"] = torch.zeros_like(param.data)
+                    else: # Non-GaLore param that somehow ended up here and needs init (should not happen for fused GaLore)
+                        state["exp_avg"]    = torch.zeros_like(param.data)
+                        state["exp_avg_sq"] = torch.zeros_like(param.data)
+
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+
+                if accumulated_projected_grad is not None:
+                    # Update moments using the accumulated projected gradient
+                    exp_avg.mul_(beta1).add_(accumulated_projected_grad, alpha=(1 - beta1))
+                    exp_avg_sq.mul_(beta2).addcmul_(accumulated_projected_grad, accumulated_projected_grad, value=(1 - beta2))
+                else:
+                    # If no accumulated gradient, moments just decay (handled by mul_(beta) if done unconditionally)
+                    # For Adam, if grad is zero, exp_avg decays, exp_avg_sq decays.
+                    exp_avg.mul_(beta1)
+                    exp_avg_sq.mul_(beta2)
+
                 # bias correction
                 if correct:
                     bias1 = 1 - beta1 ** step
